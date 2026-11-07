@@ -1,0 +1,38 @@
+[project]
+name = "molmoact-so101"
+version = "0.2.0"
+description = "MolmoAct2 zero-shot inference on the SO-101 arm (Linux/CUDA and macOS/Apple Silicon)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # On macOS this resolves to the PyPI wheel (MPS backend);
+    # on Linux it comes from the PyTorch CUDA index (see [tool.uv.sources]).
+    "torch>=2.6.0",
+    # MolmoAct2's processor imports transformers.video_utils (added in 4.52).
+    "transformers>=4.52.0",
+    "huggingface-hub>=0.24.0",
+    # IMPORTANT: exactly 0.5.1 — other versions use a different joint-angle
+    # convention and the arm will slam into the table on startup.
+    # See https://huggingface.co/docs/lerobot/backwardcomp
+    "lerobot[feetech]==0.5.1",
+    "opencv-python>=4.8.0",
+    "Pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "pyobjc-framework-avfoundation>=10 ; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+# Only needed for --scene-cam realsense. No macOS arm64 wheels on PyPI.
+realsense = ["pyrealsense2>=2.54.0; sys_platform == 'linux'"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cuda", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

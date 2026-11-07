@@ -49,6 +49,17 @@ _PATCHES = [
 ]
 
 
+def resolve_device(device: str = "auto") -> str:
+    """'auto' → cuda if available, else mps (Apple Silicon), else cpu."""
+    if device != "auto":
+        return device
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def _patch_model_for_mixed_dtype(local_dir: str) -> None:
     """Edit the snapshot's modeling_molmoact2.py in place for bf16/fp16. Idempotent."""
     target = os.path.join(local_dir, "modeling_molmoact2.py")
@@ -102,7 +113,7 @@ class MolmoActPolicy:
 
     @classmethod
     def from_pretrained(cls, repo_id: str = REPO_ID, *,
-                        dtype: str = "bfloat16", device: str = "cuda",
+                        dtype: str = "bfloat16", device: str = "auto",
                         apply_patches: bool = False,
                         norm_tag: str = NORM_TAG) -> "MolmoActPolicy":
         """Download (or reuse cached) weights and load into memory.
@@ -110,6 +121,7 @@ class MolmoActPolicy:
         Uses snapshot_download so norm_stats.json (which transformers doesn't
         auto-fetch) is present alongside the model code.
         """
+        device = resolve_device(device)
         if dtype not in DTYPES:
             raise ValueError(f"dtype must be one of {list(DTYPES)}, got {dtype!r}")
         torch_dtype = DTYPES[dtype]
@@ -156,7 +168,7 @@ class MolmoActPolicy:
                 enable_depth_reasoning=False,
                 num_steps=num_steps,
                 normalize_language=True,
-                enable_cuda_graph=cuda_graph,
+                enable_cuda_graph=cuda_graph and self.device.startswith("cuda"),
             )
         return _to_chunk_array(out.actions)
 

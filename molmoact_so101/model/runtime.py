@@ -20,6 +20,12 @@ index step_i = (now - t_obs) * ACTION_FPS, and computes a weighted average of
 those per-chunk actions with weights exp(-ensemble_m * age_seconds). This is
 the ACT temporal-ensembling formulation (Zhao et al. 2023) adapted to async
 inference where chunks arrive every ~700 ms rather than every step.
+
+exec_mode="sync" is for slower devices (Apple Silicon / CPU) where one
+prediction takes longer than the chunk's own duration (~1 s): the producer
+observes, predicts, then lets the whole chunk play out (starting at arrival
+time) before taking the next observation. The arm pauses during inference,
+but every chunk is executed from the state it was predicted for.
 """
 import collections
 import os
@@ -55,6 +61,7 @@ class RuntimeConfig:
     scene_only: bool = False
     save_frames_dir: Optional[str] = None
     dry_run: bool = False
+    exec_mode: str = "async"   # "async" (ensembling) or "sync" (predict → execute)
 
 
 class ChunkRingBuffer:
@@ -127,11 +134,13 @@ class _InferenceProducer(threading.Thread):
         self._stop_event.set()
 
     def _capture(self):
-        wrist_bgr = self.wrist.read()
+        wrist_bgr = self.wrist.read() if self.wrist is not None else None
         scene_bgr = self.scene.get_latest_color()
-        if wrist_bgr is None or scene_bgr is None:
+        need_wrist = not self.config.scene_only
+        if scene_bgr is None or (need_wrist and wrist_bgr is None):
             return None, None, None
-        self.wrist.update_observations(wrist_bgr=wrist_bgr, scene_bgr=scene_bgr)
+        if self.wrist is not None:
+            self.wrist.update_observations(wrist_bgr=wrist_bgr, scene_bgr=scene_bgr)
         self.frame_buffer.set(wrist_bgr, scene_bgr)
         arm_state = self.follower.get_state().astype(np.float32)
         return wrist_bgr, scene_bgr, arm_state
@@ -161,7 +170,7 @@ class _InferenceProducer(threading.Thread):
         while not self._stop_event.is_set():
             try:
                 wrist_bgr, scene_bgr, arm_state = self._capture()
-                if wrist_bgr is None:
+                if scene_bgr is None:
                     time.sleep(0.05)
                     continue
 
@@ -192,13 +201,30 @@ class _InferenceProducer(threading.Thread):
                           f"({dt_ms:.0f} ms) — not publishing")
                     continue
 
+                if cfg.exec_mode == "sync":
+                    # Arm was holding still during inference → play the chunk
+                    # from step 0 starting now, then wait for it to finish.
+                    t_obs = time.monotonic()
                 chunk_id = self.ring.add(actions, t_obs)
-                a0_d = actions[0] - arm_state
+                n_exec = actions.shape[0] if cfg.actions_per_chunk is None \
+                    else min(actions.shape[0], cfg.actions_per_chunk)
+                end_d = actions[n_exec - 1] - arm_state
+                max_d = np.abs(actions[:n_exec] - arm_state).max(axis=0)
                 print(
                     f"[Producer] {dt_ms:.0f} ms  id={chunk_id}  "
-                    f"a0={np.round(actions[0], 1).tolist()}  "
-                    f"Δ={np.round(a0_d, 1).tolist()}"
+                    f"Δstart={np.round(actions[0] - arm_state, 1).tolist()}  "
+                    f"Δend={np.round(end_d, 1).tolist()}  "
+                    f"max|Δ|={float(max_d.max()):.1f}°"
                 )
+                n = actions.shape[0]
+                if cfg.actions_per_chunk is not None:
+                    n = min(n, cfg.actions_per_chunk)
+                if cfg.exec_mode == "sync":
+                    self._stop_event.wait(n / ACTION_FPS)
+                elif dt_ms / 1000.0 > n / ACTION_FPS:
+                    print(f"[Producer] WARNING: inference ({dt_ms:.0f} ms) is slower "
+                          f"than the chunk duration ({n / ACTION_FPS * 1000:.0f} ms) — "
+                          "chunks expire before use. Use --exec-mode sync.")
             except Exception as e:
                 print(f"[Producer] {type(e).__name__}: {e}")
                 time.sleep(0.1)

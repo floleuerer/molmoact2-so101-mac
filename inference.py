@@ -1,20 +1,29 @@
 """
 inference.py — Run MolmoAct2-SO100_101 zero-shot on the SO-101.
 
-Single machine, no WebRTC. Captures the wrist USB camera and the RealSense
-D455 colour stream, feeds both plus the current joint state to MolmoAct2, and
-executes the predicted action chunks on the follower arm at --exec-hz via
-temporal ensembling.
+Single machine, no WebRTC. Captures a wrist camera and a scene camera
+(RealSense D455, or any webcam / network stream), feeds both plus the current
+joint state to MolmoAct2, and executes the predicted action chunks on the
+follower arm at --exec-hz.
 
-Usage:
-    python inference.py \
-        --follower-port /dev/ttyACM0 \
-        --wrist-cam-id 8 \
+Runs on Linux + CUDA and on macOS + Apple Silicon (MPS).
+
+Usage (Linux, RealSense scene camera):
+    uv run inference.py --follower-port /dev/ttyACM0 --wrist-cam 8 \
+        --prompt "pick up the lemon and drop it in the red bowl"
+
+Usage (macOS, two webcams — find indices with `uv run cameras.py`):
+    uv run inference.py --wrist-cam 1 --scene-cam 0 \
         --prompt "pick up the lemon and drop it in the red bowl"
 """
 import argparse
 import atexit
 import os
+
+# Let ops without an MPS kernel fall back to CPU instead of crashing.
+# Must be set before torch is imported.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import signal
 import sys
 import threading
@@ -23,25 +32,37 @@ import time
 import cv2
 import numpy as np
 
-from molmoact_so101.setup.robot import FollowerArm, RealSenseCapture
+from molmoact_so101.setup.cameras import IS_MAC, OpenCVCamera
+from molmoact_so101.setup.ports import resolve_follower_port
+from molmoact_so101.setup.robot import FollowerArm
 from molmoact_so101.setup.wrist_camera import WristCamera, FLIP_CHOICES
 from molmoact_so101.setup.frame_transforms import (
     parse_joint_limits, parse_joint_offsets, parse_joint_signs,
 )
-from molmoact_so101.model.policy import MolmoActPolicy, REPO_ID, DTYPES as _DTYPES
+from molmoact_so101.model.policy import (
+    MolmoActPolicy, REPO_ID, DTYPES as _DTYPES, resolve_device,
+)
 from molmoact_so101.model.runtime import AsyncPolicyRunner, RuntimeConfig
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="MolmoAct2 zero-shot inference on SO-101")
     # ── Hardware ──────────────────────────────────────────────────────────────
-    p.add_argument("--follower-port", default="/dev/ttyACM0",
-                   help="Serial port for the SO-101 follower arm.")
-    p.add_argument("--wrist-cam-id", type=int, default=8,
-                   help="OpenCV index of the wrist USB camera. "
-                        "Find yours with `v4l2-ctl --list-devices`.")
+    p.add_argument("--follower-port", default="auto",
+                   help="Serial port for the SO-101 follower arm. 'auto' picks the "
+                        "only /dev/tty.usbmodem* (macOS) or /dev/ttyACM* (Linux). "
+                        "Find yours with `uv run lerobot-find-port`.")
+    p.add_argument("--wrist-cam", "--wrist-cam-id", dest="wrist_cam", default=None,
+                   help="Wrist camera: OpenCV index (e.g. 1) or stream URL "
+                        "(e.g. tcp://raspberrypi.local:8888). "
+                        "Find indices with `uv run cameras.py`. Default on Linux: 8.")
     p.add_argument("--wrist-flip", choices=FLIP_CHOICES, default="180",
                    help="Flip the wrist image to match training orientation.")
+    p.add_argument("--scene-cam", default=None,
+                   help="Scene (third-person) camera: 'realsense', an OpenCV index, "
+                        "or a stream URL. Default on Linux: realsense.")
+    p.add_argument("--scene-flip", choices=FLIP_CHOICES, default="none",
+                   help="Flip the scene image.")
     p.add_argument("--realsense-serial", default=None,
                    help="RealSense D455 serial number. Omit to use the first device found.")
     # ── Task ─────────────────────────────────────────────────────────────────
@@ -56,8 +77,14 @@ def parse_args():
                         "the model. Default: full chunk (~30 steps at 30 fps).")
     p.add_argument("--exec-hz", type=float, default=30.0,
                    help="Rate at which joint targets are sent to the arm (Hz).")
-    p.add_argument("--device", default="cuda")
+    p.add_argument("--device", default="auto",
+                   help="auto (cuda → mps → cpu), cuda, mps or cpu.")
     p.add_argument("--dtype", default="bfloat16", choices=list(_DTYPES))
+    p.add_argument("--exec-mode", choices=["auto", "async", "sync"], default="auto",
+                   help="async: predict continuously, temporal-ensemble chunks "
+                        "(needs inference faster than ~1 s, i.e. a CUDA GPU). "
+                        "sync: observe → predict → execute the whole chunk → repeat; "
+                        "the arm pauses during inference. auto: async on CUDA, else sync.")
     p.add_argument("--cuda-graph", action="store_true",
                    help="Enable cuda graphs (faster, uses more VRAM, needs a warm-up).")
     p.add_argument("--warmup-predictions", type=int, default=None,
@@ -91,7 +118,9 @@ def parse_args():
                         "Try 0.5–0.7 if you see high-frequency jitter.")
     # ── Misc ──────────────────────────────────────────────────────────────────
     p.add_argument("--scene-only", action="store_true",
-                   help="Pass the RealSense scene image twice, ignoring the wrist "
+                   help="Pass the scene image twice and don't use a wrist camera "
+                        "(--wrist-cam is then optional; if given it's only shown "
+                        "with --show). "
                         "camera. The training data uses two third-person views; "
                         "try this if wrist images are out-of-distribution.")
     p.add_argument("--save-frames-dir", default=None,
@@ -103,11 +132,31 @@ def parse_args():
                    help="Show cv2 camera preview windows (press Q to quit).")
     p.add_argument("--dry-run", action="store_true",
                    help="Run inference and print actions but do NOT move the arm.")
-    return p.parse_args()
+    args = p.parse_args()
+
+    if args.wrist_cam is None and not args.scene_only:
+        if IS_MAC:
+            p.error("--wrist-cam is required on macOS (index or URL). "
+                    "Run `uv run cameras.py` to find it.")
+        args.wrist_cam = "8"
+    if args.scene_only and args.wrist_cam is None:
+        print("[MolmoAct] --scene-only: no wrist camera.")
+    if args.scene_cam is None:
+        if IS_MAC:
+            p.error("--scene-cam is required on macOS (index or URL). "
+                    "Run `uv run cameras.py` to find it.")
+        args.scene_cam = "realsense"
+    return args
 
 
-def warmup_cameras(wrist: WristCamera, scene: RealSenseCapture,
-                   timeout: float = 30.0) -> None:
+def open_scene_camera(args):
+    if args.scene_cam.lower() == "realsense":
+        from molmoact_so101.setup.robot import RealSenseCapture
+        return RealSenseCapture(serial=args.realsense_serial)
+    return OpenCVCamera(args.scene_cam, name="Scene", flip=args.scene_flip)
+
+
+def warmup_cameras(wrist, scene, timeout: float = 30.0) -> None:
     """Block until both cameras produce frames, or raise on timeout.
 
     RealSense on USB 2.1 can take several seconds to deliver the first frame.
@@ -115,29 +164,29 @@ def warmup_cameras(wrist: WristCamera, scene: RealSenseCapture,
     print("[MolmoAct] Warming up cameras (up to 30 s)...")
     t_start  = time.time()
     next_log = t_start + 2.0
-    wrist_ok = scene_ok = False
+    wrist_ok = wrist is None
+    scene_ok = False
     while time.time() - t_start < timeout:
         if not wrist_ok and wrist.read() is not None:
             wrist_ok = True
             print(f"[MolmoAct]   wrist ready ({time.time()-t_start:.1f}s)")
         if not scene_ok and scene.get_latest_color() is not None:
             scene_ok = True
-            print(f"[MolmoAct]   RealSense ready ({time.time()-t_start:.1f}s)")
+            print(f"[MolmoAct]   scene ready ({time.time()-t_start:.1f}s)")
         if wrist_ok and scene_ok:
             return
         if time.time() > next_log:
-            print(f"[MolmoAct]   waiting... wrist={wrist_ok} realsense={scene_ok}")
+            print(f"[MolmoAct]   waiting... wrist={wrist_ok} scene={scene_ok}")
             next_log = time.time() + 2.0
         time.sleep(0.1)
     raise RuntimeError(
         f"Cameras did not produce frames in {timeout:.0f}s "
-        f"(wrist={wrist_ok}, realsense={scene_ok}). "
-        "Check USB connections — RealSense needs a USB-3 data cable."
+        f"(wrist={wrist_ok}, scene={scene_ok}). "
+        "Check USB connections / stream URLs. A RealSense needs a USB-3 data cable."
     )
 
 
-def install_cleanup_handlers(follower: FollowerArm, wrist: WristCamera,
-                             scene: RealSenseCapture):
+def install_cleanup_handlers(follower: FollowerArm, wrist, scene):
     """Register an idempotent cleanup that fires on any exit path."""
     lock = threading.Lock()
     done = [False]
@@ -153,7 +202,7 @@ def install_cleanup_handlers(follower: FollowerArm, wrist: WristCamera,
             lambda: follower.request_torque(False),
             lambda: follower.disconnect(),
             lambda: scene.release(),
-            lambda: wrist.close(),
+            lambda: wrist is not None and wrist.close(),
         ]:
             try:
                 fn()
@@ -176,19 +225,30 @@ def run_display_loop(runner: AsyncPolicyRunner, show: bool) -> None:
                 if wrist_bgr is not None:
                     cv2.imshow("wrist", wrist_bgr)
                 if scene_bgr is not None:
-                    cv2.imshow("realsense", scene_bgr)
+                    cv2.imshow("scene", scene_bgr)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     return
             else:
                 time.sleep(0.05)
     except KeyboardInterrupt:
-        print("\n[MolmoAct] Interrupted.")
+        # Ignore further Ctrl+C so the shutdown (torque off, devices released)
+        # can't be cut short half-way.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        print("\n[MolmoAct] Stopping — finishing the current inference (a few "
+              "seconds). Torque will be switched off: support the arm if it's raised.")
 
 
 def main():
     args = parse_args()
+    args.device = resolve_device(args.device)
+    if args.exec_mode == "auto":
+        args.exec_mode = "async" if args.device.startswith("cuda") else "sync"
+    if args.cuda_graph and not args.device.startswith("cuda"):
+        print("[MolmoAct] --cuda-graph ignored (not on CUDA).")
+        args.cuda_graph = False
     if args.warmup_predictions is None:
         args.warmup_predictions = 2 if args.cuda_graph else 0
+    print(f"[MolmoAct] device={args.device}  exec_mode={args.exec_mode}")
 
     joint_offsets = parse_joint_offsets(args.joint_offsets)
     joint_signs   = parse_joint_signs(args.joint_signs)
@@ -207,10 +267,11 @@ def main():
         apply_patches=False,
     )
 
-    wrist    = WristCamera(args.wrist_cam_id, flip=args.wrist_flip,
-                           enable_ae=not args.no_wrist_ae)
-    follower = FollowerArm(port=args.follower_port)
-    scene    = RealSenseCapture(serial=args.realsense_serial)
+    wrist    = (WristCamera(args.wrist_cam, flip=args.wrist_flip,
+                            enable_ae=not args.no_wrist_ae)
+                if args.wrist_cam is not None else None)
+    scene    = open_scene_camera(args)
+    follower = FollowerArm(port=resolve_follower_port(args.follower_port))
 
     warmup_cameras(wrist, scene)
     follower.set_target(follower.get_state())  # latch current pose before torque-on
@@ -238,6 +299,7 @@ def main():
         scene_only=args.scene_only,
         save_frames_dir=args.save_frames_dir,
         dry_run=args.dry_run,
+        exec_mode=args.exec_mode,
     )
 
     try:

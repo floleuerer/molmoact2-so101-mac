@@ -1,87 +1,69 @@
-"""High-level wrist camera abstraction for the SO-101 USB wrist camera.
+"""High-level wrist camera abstraction for the SO-101 wrist camera.
 
-Wraps cv2 capture, v4l2 manual-mode setup, an optional adaptive-brightness
-controller, and ordered shutdown. The shutdown ordering (stop AE thread →
-join → release cap → reset v4l2 to auto) matters: a naive sequence races
-and can leave the next consumer with a stuck-manual camera.
+The wrist camera can be a local USB camera (index) or a network stream (URL,
+e.g. a Raspberry Pi camera streamed with rpicam-vid). Capture is handled by
+OpenCVCamera.
+
+On Linux with a local V4L2 camera, white balance is additionally locked via
+v4l2-ctl and an optional adaptive-brightness controller runs. Those controls
+don't exist on macOS / network streams and are skipped there. The shutdown
+ordering (stop AE thread → join → release cap → reset v4l2 to auto) matters:
+a naive sequence races and can leave the next consumer with a stuck-manual
+camera.
 """
-import os
 import threading
 
-import cv2
 import numpy as np
 
+from .cameras import FLIP_CHOICES, IS_LINUX, OpenCVCamera, parse_source
 from .wrist_v4l2 import set_v4l2, reset_wrist_to_auto
 
-
-FLIP_CHOICES = ["v", "h", "180", "none"]
-_FLIP_CODES = {"v": 0, "h": 1, "180": -1}
+__all__ = ["WristCamera", "FLIP_CHOICES"]
 
 
 class WristCamera:
-    def __init__(self, cam_id, flip="180", enable_ae=False):
-        self.cam_id = cam_id
-        self.flip_code = _FLIP_CODES.get(flip)  # None for "none"
-        self._cap = None
-        self._ae = None
-
-        dev = f"/dev/video{cam_id}"
-        if not os.path.exists(dev):
-            present = sorted(p for p in os.listdir("/dev") if p.startswith("video"))
-            raise FileNotFoundError(
-                f"{dev} does not exist — wrist camera not connected. "
-                f"Available video devices: {present}. "
-                f"Check with `v4l2-ctl --list-devices`."
+    def __init__(self, source, flip="180", enable_ae=False):
+        self.source = parse_source(source)
+        self._v4l2  = IS_LINUX and isinstance(self.source, int)
+        self._ae    = None
+        self._cam   = OpenCVCamera(self.source, name="Wrist", flip=flip)
+        if self._v4l2:
+            # Lock white balance to a fixed temperature — auto WB drift between
+            # sessions can collapse predicted action deltas to near zero.
+            set_v4l2(
+                self.source,
+                white_balance_automatic=0,
+                white_balance_temperature=4600,
+                auto_exposure=1,
+                brightness=32,
             )
-        cap = cv2.VideoCapture(cam_id)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open wrist camera at index {cam_id}")
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        # Lock white balance to a fixed temperature — auto WB drift between
-        # sessions can collapse predicted action deltas to near zero.
-        set_v4l2(
-            cam_id,
-            white_balance_automatic=0,
-            white_balance_temperature=4600,
-            auto_exposure=1,
-            brightness=32,
-        )
-        self._cap = cap
-        if enable_ae:
-            self._ae = _AEController(cam_id)
+            if enable_ae:
+                self._ae = _AEController(self.source)
 
     def read(self):
-        self._cap.grab()  # flush stale buffered frame
-        ok, img = self._cap.read()
-        if not ok:
-            return None
-        if self.flip_code is not None:
-            img = cv2.flip(img, self.flip_code)
-        return img
+        return self._cam.read()
 
     def update_observations(self, *, wrist_bgr=None, scene_bgr=None):
         if self._ae is not None:
             self._ae.update_observations(wrist_bgr=wrist_bgr, scene_bgr=scene_bgr)
 
     def close(self):
-        if self._cap is None:
+        if self._cam is None:
             return
         if self._ae is not None:
             self._ae.stop()
             self._ae.join(timeout=2.0)
             self._ae = None
-        self._cap.release()
-        self._cap = None
-        reset_wrist_to_auto(self.cam_id)
+        self._cam.close()
+        self._cam = None
+        if self._v4l2:
+            reset_wrist_to_auto(self.source)
 
 
 class _AEController:
     """Adaptive brightness controller for cameras whose exposure_time_absolute
     is non-functional. Nudges the `brightness` v4l2 control on a slow loop to
-    track a target intensity, optionally matching the RealSense scene mean so
+    track a target intensity, optionally matching the scene camera mean so
     both cameras stay matched as room lighting changes.
     """
 

@@ -1,170 +1,257 @@
-# MolmoAct2 on SO-101
+# MolmoAct2 on SO-101 — macOS / Apple Silicon edition
 
-Zero-shot robot manipulation using [MolmoAct2](https://huggingface.co/allenai/MolmoAct2-SO100_101) from AI2 on a [SO-101](https://github.com/TheRobotStudio/SO-ARM100) arm. You give it a natural-language prompt; it figures out the motions. No training, no demonstrations. The model takes RGB frames from a side-view RealSense D455 and a wrist webcam, plus the current joint state, and outputs a chunk of joint targets that get executed with temporal ensembling at 30 Hz. See it in action: [this X post](https://twitter.com/irenekarrot/status/2053966402986647692) — and the official MolmoAct2 announcement from AI2: [allenai.org/blog/molmoact2](https://allenai.org/blog/molmoact2).
+Zero-shot robot manipulation with [MolmoAct2](https://huggingface.co/allenai/MolmoAct2-SO100_101) from AI2 on a [SO-101](https://github.com/TheRobotStudio/SO-ARM100) arm, **running locally on a Mac with Apple Silicon**: no NVIDIA GPU, no RealSense, just ordinary USB webcams. You give it a natural-language prompt; it predicts joint targets from camera images and the current joint state. No training, no demonstrations.
+
+> **Fork notice.** This is a macOS-focused fork of [irenegracekp/molmoact2-so101](https://github.com/irenegracekp/molmoact2-so101), which targets Linux + CUDA + RealSense. See it in action in [the original author's X post](https://twitter.com/irenekarrot/status/2053966402986647692), and read AI2's announcement at [allenai.org/blog/molmoact2](https://allenai.org/blog/molmoact2).
+>
+> What this fork adds:
+> - Runs on **Apple Silicon (MPS)** in bfloat16; device is auto-detected
+> - **Any USB webcam** as scene or wrist camera, selected **by name** (`--scene-cam C920`), plus network streams
+> - **`--exec-mode sync`** for devices where one prediction takes longer than the 1 s chunk it produces (the default off CUDA)
+> - **`--scene-only` without a wrist camera**
+> - `cameras.py`: camera finder, live preview and **focus aid**
+> - **uv** for dependency management (`pyproject.toml` + `uv.lock`)
+>
+> Linux + CUDA + RealSense still works. See [Linux / CUDA](#linux--cuda).
 
 ---
 
 ## Hardware
 
-| Part | Link |
+| Part | Notes |
 |---|---|
-| SO-101 arm (follower) | [TheRobotStudio SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100) |
-| RealSense D455 (side/scene view, RGB only) | [Intel RealSense D455](https://www.intelrealsense.com/depth-camera-d455/) |
-| USB webcam (wrist view) | Any 640×480 USB webcam — we used an XWF-1080P |
-
-The RealSense needs a **USB 3 data cable** (not charge-only) and a USB 3 port. On USB 2.1 it drops to 15 fps which still works but is slower to warm up.
+| Mac with Apple Silicon | Tested: M4 Pro, 48 GB, macOS 15. The model uses ~11 GB of unified memory in bfloat16; 32 GB+ RAM recommended. |
+| SO-101 follower arm | [TheRobotStudio SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100), **with its own power supply** (USB alone does not power the servos) |
+| Scene camera | Any USB webcam, e.g. Logitech C920 (tested) or a Canon webcam |
+| Wrist camera (optional) | Any USB webcam, e.g. Innomaker U20CAM-1080p (tested) |
+| Disk | ~22 GB for the model weights |
 
 ---
 
-## Environment setup
-
-**Python 3.12.** LeRobot 0.5.x requires Python ≥ 3.12 on PyPI, and the 0.5.1 pin below is non-negotiable (see [Calibration](#calibration) for why). Older LeRobot releases ran on 3.10/3.11, but those won't work for this repo.
+## Quickstart (macOS)
 
 ```bash
-conda create -n molmoact python=3.12 -y
-conda activate molmoact
+# 1. Install (uv fetches Python 3.12 if needed)
+brew install uv            # if you don't have it
+uv sync
+
+# 2. Find the cameras
+uv run cameras.py          # lists cameras by name, saves a snapshot of each to camera_snapshots/
+
+# 3. Calibrate the arm (once; arm plugged in and powered; port is auto-detected)
+uv run calibrate.py
+
+# 4. Dry run: model runs, arm stays still
+uv run inference.py --scene-cam C920 --scene-only --show --dry-run \
+    --prompt "Move the arm towards the lemon, grasp it, lift it up, and drop it into the red bowl."
+
+# 5. Real run (start gentle)
+uv run inference.py --scene-cam C920 --scene-only --show --max-step-deg 5 \
+    --prompt "Move the arm towards the lemon, grasp it, lift it up, and drop it into the red bowl."
 ```
 
-**Install everything in one shot:**
+The first run downloads the model (~22 GB) from Hugging Face. Press `Ctrl+C` **once** to stop: the program finishes the current inference and then switches off torque, so **support the arm if it's raised**.
+
+---
+
+## Installation
+
+Dependencies are managed with [uv](https://docs.astral.sh/uv/); Python 3.12 is required (LeRobot 0.5.x needs ≥ 3.12).
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
-This installs PyTorch (CUDA 12.1 wheels by default), `lerobot==0.5.1`, the Feetech servo SDK, the HuggingFace stack, the camera libs, and numpy.
-
-**Pins worth knowing:**
+Run everything through `uv run …`; there's no need to activate the venv.
 
 | Package | Pin | Why |
 |---|---|---|
-| `lerobot` | `==0.5.1` | Joint-angle convention — see [Calibration](#calibration). |
-| `transformers` | `>=4.52.0` | MolmoAct2's processor imports `transformers.video_utils`, added in 4.52. Earlier versions fail at processor load with `ModuleNotFoundError: No module named 'transformers.video_utils'`. |
-| `feetech-servo-sdk` | (any) | SO-101 motor bus. Without it, `inference.py` silently falls back to a simulated follower and the arm will not move. |
-| `torch` | CUDA 12.1 wheels | If your driver needs a different CUDA, install torch manually first from [pytorch.org](https://pytorch.org/get-started/locally/), then re-run `pip install -r requirements.txt` (pip will skip the satisfied torch line). |
+| `lerobot[feetech]` | `==0.5.1` | Joint-angle convention, see [Calibration](#calibration). The `feetech` extra installs the servo SDK; without it `inference.py` silently falls back to a simulated arm. |
+| `transformers` | `>=4.52.0` | MolmoAct2's processor imports `transformers.video_utils`. |
+| `torch` | PyPI wheel | Includes the MPS backend on macOS. |
+| `pyobjc-framework-avfoundation` | macOS only | Selecting cameras by name. |
 
-**MolmoAct2 weights** are downloaded automatically from HuggingFace on first run via `transformers` with `trust_remote_code=True`. No separate install needed.
+**macOS notes**
+- **Camera permission:** the first time, macOS asks whether your terminal may use the camera. If you dismissed it: System Settings → Privacy & Security → Camera → enable your terminal app, then restart it.
+- If your shell sets `UV_ENV_FILE=.env`, `uv run` fails when `.env` doesn't exist. Fix it with `touch .env` (it's gitignored).
+- `objc: Class AVFFrameReceiver is implemented in both …` at startup is harmless: OpenCV and PyAV both bundle libavdevice, but camera capture doesn't use it.
+
+---
+
+## Cameras
+
+```bash
+uv run cameras.py                     # name ↔ index mapping + one snapshot per camera
+uv run cameras.py --show              # live preview of every camera
+uv run cameras.py --focus Innomaker   # focus aid: live view with a sharpness score
+uv run cameras.py --url rtsp://camera.local:8554/stream   # test a network stream
+```
+
+`--scene-cam` / `--wrist-cam` accept:
+- a **name substring** such as `C920`, `Innomaker` or `Canon` (recommended). macOS renumbers cameras whenever something is re-plugged, and the order shown by ffmpeg / System Information is *not* OpenCV's order. Names are resolved to the right index at startup.
+- an **OpenCV index** such as `1`
+- a **stream URL** (`rtsp://`, `tcp://`, `http://`) such as `rtsp://camera.local:8554/stream`. A background thread keeps only the newest frame, so stream buffering doesn't add latency.
+
+Every frame is centre-cropped to 4:3 and resized to 640×480 (the training resolution), so 16:9 webcams such as the Canon EOS Webcam Utility or Continuity Camera are fine.
+
+**Wrist orientation:** `--wrist-flip` defaults to `180` (the original author's camera is mounted upside down). If your wrist image looks upside down in `--show`, use `--wrist-flip none`. The focus aid always shows the unrotated image.
+
+**Focusing the wrist camera:** run `uv run cameras.py --focus <name>`, hold something textured in the yellow box at grasp distance (5–15 cm from the gripper), and turn the lens until the score peaks. Keys: `R` resets the best score, `Q`/`Esc` quits. Lock the lens afterwards; arm vibration will slowly shift it.
 
 ---
 
 ## Calibration
 
-### Joint calibration (required)
-
-LeRobot needs to know each motor's zero position. Run LeRobot's calibration wizard once per arm:
+**Power first.** The arm's power supply must be connected; USB only powers the controller board. Without servo power, LeRobot reports `Missing motor IDs: 1 … 6` / `found motor list: {}`.
 
 ```bash
-lerobot-calibrate --robot-type so101 --robot-port /dev/ttyACM0
+uv run calibrate.py                                  # auto-detects the arm's port
+uv run calibrate.py --port /dev/tty.usbmodemXXXX     # or give it explicitly
 ```
 
-This writes a calibration file to `~/.cache/huggingface/lerobot/calibration/robots/so_follower/so_follower.json`.
+`calibrate.py` runs LeRobot's calibration wizard with the settings `inference.py` expects (`--robot.type=so101_follower --robot.id=so_follower`).
 
-**Replace `configs/so_follower.json` with your own file** — the one in this repo is specific to our arm and will produce wrong joint angles on yours:
+### Finding the arm's port
+
+Auto-detection (in `calibrate.py` and `inference.py`) works when exactly **one** arm is connected over USB. If it reports several ports, or you want to check by hand:
 
 ```bash
-cp ~/.cache/huggingface/lerobot/calibration/robots/so_follower/so_follower.json \
-   configs/so_follower.json
+ls /dev/tty.usbmodem*        # macOS: one entry per connected arm, e.g. /dev/tty.usbmodem58760435711
+ls /dev/ttyACM*              # Linux
+uv run lerobot-find-port     # interactive: unplug the arm's USB when asked; the port that disappears is the arm
 ```
 
-### ⚠️ LeRobot version / calibration gotcha
+- **No port at all** → the USB cable isn't connected, or it's a charge-only cable.
+- **Several ports** → usually a leader arm or another USB-serial device. Unplug it, or pass `--port` / `--follower-port` explicitly.
+- The name stays the same as long as you use the same controller board, so you can keep it in your shell history.
+- Use the `/dev/tty.*` name on macOS, not `/dev/cu.*`.
 
-If you calibrate with LeRobot ≥ 0.5.0 but run inference with the wrong joint-angle offsets, **the arm will slam hard into the table on startup**. This is the most common failure mode.
+### The calibration wizard
 
-MolmoAct2 was trained on LeRobot datasets using the v2.1 joint-angle convention. LeRobot 0.5.x records calibrations in the v3.0 convention. The default `--joint-offsets` and `--joint-signs` in `inference.py` apply the official conversion automatically, but only if you calibrated with **exactly lerobot 0.5.1**.
+1. Move every joint to the middle of its range and press Enter.
+2. Move **every joint end to end**, including the **gripper fully open and fully closed**, then press Enter.
 
-Full details: [https://huggingface.co/docs/lerobot/backwardcomp](https://huggingface.co/docs/lerobot/backwardcomp)
+The result is written to `~/.cache/huggingface/lerobot/calibration/robots/so_follower/so_follower.json`, which `inference.py` reads (robot id `so_follower`). Sanity check: each joint except `wrist_roll` should cover roughly 160–220°, and the gripper roughly 100–130°. A gripper range of ~40° means it wasn't opened fully, and the gripper won't open far enough to grasp.
+
+`configs/so_follower.json` is the original author's arm, kept for reference only. Don't use it for your arm.
+
+### ⚠️ LeRobot version gotcha
+
+MolmoAct2 was trained on LeRobot datasets using the v2.1 joint-angle convention; LeRobot 0.5.x calibrates in the v3.0 convention. The default `--joint-offsets 0,90,90,0,0,0` and `--joint-signs 1,-1,1,1,1,1` apply the [official conversion](https://huggingface.co/docs/lerobot/backwardcomp), but only for calibrations made with **exactly lerobot 0.5.1** (pinned in `uv.lock`). Any other version can make **the arm slam into the table on startup**.
 
 ---
 
 ## Running
 
-### 1. Find your camera and arm ports
-
 ```bash
-# List video devices
-v4l2-ctl --list-devices
-
-# Find the arm serial port (interactive — unplug/replug to identify)
-lerobot-find-port
+uv run inference.py --scene-cam C920 [--wrist-cam Innomaker | --scene-only] --prompt "..." [options]
 ```
 
-### 2. Launch inference
+### How it runs on a Mac
 
-```bash
-python inference.py \
-    --follower-port /dev/ttyACM0 \
-    --wrist-cam-id 8 \
-    --prompt "pick up the lemon and drop it in the red bowl"
+On an M4 Pro one prediction takes **~2.2 s** (the first ~3–4 s) and yields a 30-step chunk, i.e. 1 s of motion. Because prediction is slower than execution, the default is **`--exec-mode sync`**: observe → predict (arm holds still) → play the chunk → repeat. Expect stop-and-go motion. The async temporal-ensembling mode from the original repo needs inference under ~1 s (a CUDA GPU).
+
+Each chunk logs how far it wants to move:
 ```
-
-Add `--show` to open cv2 preview windows for both cameras. Press `Q` or `Ctrl+C` to stop.
-
-### 3. Dry run (model only, arm does not move)
-
-```bash
-python inference.py \
-    --follower-port /dev/ttyACM0 \
-    --wrist-cam-id 8 \
-    --prompt "pick up the lemon" \
-    --dry-run
+[Producer] 2180 ms  id=4  Δstart=[...]  Δend=[...]  max|Δ|=23.4°
 ```
-
-Use this to verify the model is loading and producing sensible joint targets before letting it move the arm.
-
-### Expected behaviour
-
-- Model downloads on first run (~15 GB). Subsequent runs load from the HF cache.
-- Camera warmup takes up to 30 s (RealSense on USB 2.1 is the slow path).
-- First inference chunk takes ~700 ms on a laptop GPU (RTX 3080 or better recommended). The arm starts moving after the first chunk; subsequent chunks arrive continuously.
-- The console prints inference time, chunk ID, and first/last predicted joint targets each cycle.
+If `max|Δ|` stays at a few degrees chunk after chunk, the model is predicting "stay still". See [Getting the model to move](#getting-the-model-to-move).
 
 ### Key options
 
 | Flag | Default | Description |
 |---|---|---|
 | `--prompt` | *(required)* | Natural-language task instruction |
-| `--exec-hz` | `30.0` | Rate at which joint targets are sent to the arm |
-| `--max-step-deg` | `15.0` | Per-tick joint motion cap — scale this down if motion is jerky |
-| `--num-steps` | `10` | Flow solver iterations — higher = more accurate, slower |
-| `--scene-only` | off | Use RealSense image for both inputs, ignore wrist cam |
-| `--dry-run` | off | Print actions only, arm does not move |
-| `--show` | off | Show cv2 camera preview windows |
+| `--scene-cam` | *(required on macOS)* | Scene camera: name, index or URL (`realsense` on Linux) |
+| `--wrist-cam` | *(required unless `--scene-only`)* | Wrist camera: name, index or URL |
+| `--scene-only` | off | Feed the scene image into both model inputs; no wrist camera needed |
+| `--wrist-flip` / `--scene-flip` | `180` / `none` | `none`, `180`, `v` (vertical) or `h` (mirror) |
+| `--follower-port` | `auto` | Picks the only `/dev/tty.usbmodem*`, see [Finding the arm's port](#finding-the-arms-port) |
+| `--device` | `auto` | `cuda` → `mps` → `cpu` |
+| `--dtype` | `bfloat16` | `float32` also fits in 48 GB, but is ~2× slower |
+| `--exec-mode` | `auto` | `sync` off CUDA, `async` on CUDA |
+| `--actions-per-chunk` | 30 (all) | Execute only the first N steps of each chunk before re-observing |
+| `--max-step-deg` | `15.0` | Per-tick joint motion cap; use ~5 for first tests |
+| `--joint-min` / `--joint-max` | none | Hard per-joint limits in arm frame, e.g. `none,-65,none,none,none,none` |
+| `--num-steps` | `10` | Flow-solver iterations |
+| `--dry-run` | off | Run the model and log actions; the arm does not move |
+| `--show` | off | Camera preview windows (`Q` to quit) |
+| `--save-frames-dir` | off | Save the exact images fed to the model |
+
+### Getting the model to move
+
+MolmoAct2 is used zero-shot here, so how closely your scene resembles its training data decides almost everything. The training data (community SO-100/101 LeRobot datasets) looks like this: **bright, even light; a light, plain table; chunky colourful objects (fruit, bowls, cubes); a side view at table height and/or a top-down view showing the whole arm and the objects.** In practice:
+
+1. **Light**: bright and even, not dim evening light.
+2. **Table**: put white paper or a light board under the workspace; clear the background.
+3. **Camera**: show the **whole arm and the objects**, either from the side at table height (arm on one side, objects in front of it) or from above.
+4. **Objects**: chunky and colourful. Thin items like pens are hard.
+5. **Prompt**: phrase it like the training tasks: `"Move the arm towards the <object>, grasp it, lift it up, and drop it into the <container>."`
+6. **Use `--dry-run`** while adjusting the scene, and drop it once `max|Δ|` regularly exceeds ~15–20°.
+
+Demonstrations often begin with a short pause, so a chunk predicted from a resting arm frequently has its motion only in the second half. Seeing nothing at all for a few chunks, while the official sample does move, is a sign the scene is too far from the training data.
+
+To check the model itself works on your Mac, run the official sample from the [model card](https://huggingface.co/allenai/MolmoAct2-SO100_101). It should predict 15–45° of shoulder/elbow motion within a chunk.
+
+---
+
+## Linux / CUDA
+
+The original Linux setup still works:
+
+```bash
+uv sync --extra realsense        # adds pyrealsense2
+uv run inference.py --follower-port /dev/ttyACM0 --wrist-cam 8 \
+    --prompt "pick up the lemon and drop it in the red bowl"
+```
+
+- `torch` comes from the PyTorch CUDA 12.8 index (change the `pytorch-cuda` URL in `pyproject.toml` and `uv lock` for another CUDA version).
+- Defaults on Linux: `--scene-cam realsense`, `--wrist-cam 8`, `--exec-mode async` (~700 ms per chunk on an RTX 3080-class GPU), with optional `--cuda-graph`.
+- The RealSense D455 needs a USB 3 data cable; on USB 2.1 it runs at 15 fps.
+- On Linux the wrist camera's white balance is locked via `v4l2-ctl` (`sudo apt install v4l-utils`), and an adaptive brightness controller runs (disable it with `--no-wrist-ae`).
 
 ---
 
 ## Known limitations
 
-- **Wrist webcam is out-of-distribution.** MolmoAct2 was trained on two third-person RealSense views (top + side). The wrist camera view was not in the training data. If the arm behaves poorly, try `--scene-only` to pass the side RealSense view twice and skip the wrist image entirely.
-- **No depth into the model.** `enable_depth_reasoning=False` — the RealSense depth stream is not used. RGB only.
-- **Single arm only.** This runs the follower arm in autonomous mode with no leader arm or teleop fallback.
-- **GPU required.** bfloat16 inference on CUDA. CPU inference is not tested and will be very slow.
-- **~15 GB download on first run.** The MolmoAct2 weights are large. Make sure you have disk space and a decent connection.
+- **Zero-shot is fragile.** A new arm, room, camera angle and lighting are all out of distribution. If it won't work reliably, the next step is recording demonstrations and fine-tuning.
+- **Wrist images are out of distribution.** MolmoAct2-SO100_101 was trained on two third-person views, so `--scene-only` is often as good or better.
+- **Stop-and-go on Mac.** Inference (~2.2 s) is slower than a chunk (1 s), so the arm pauses between chunks.
+- **No depth.** RGB only (`enable_depth_reasoning=False`).
+- **Single arm, no teleop fallback.**
 
 ---
 
 ## Troubleshooting
 
+**`Missing motor IDs: 1 … 6` / `found motor list: {}`**
+The servos have no power. Connect the arm's power supply (USB alone is not enough) and check the 3-pin cable from the board to the base servo.
+
 **Arm jerks to one position at startup, then a motor stops responding**
-Joint calibration mismatch — see the [calibration gotcha](#️-lerobot-version--calibration-gotcha) above. Power-cycle the arm and re-run `lerobot-calibrate`.
+Calibration mismatch, see the [LeRobot version gotcha](#️-lerobot-version-gotcha). Power-cycle the arm and recalibrate with the pinned lerobot.
 
-**`No module named 'scservo_sdk'`**
-```bash
-pip install feetech-servo-sdk
-```
+**Camera can't be opened / shows black**
+Check the camera permission (above), run `uv run cameras.py`, and pass the camera **by name**. A camera that shows a nearly black image is usually covered or facing something dark.
 
-**`No RealSense devices found`**
-Check `rs-enumerate-devices`. If empty, it's a USB cable or port issue — the D455 needs a USB 3 data cable, not a charge-only cable. Try a different port.
+**`Camera name 'X' matches no camera`**
+The camera isn't connected or is named differently. The error lists the connected cameras.
 
-**Wrist camera not found (`/dev/videoN does not exist`)**
-Run `v4l2-ctl --list-devices` to find the right index and pass it as `--wrist-cam-id N`.
+**Arm never moves; `max|Δ|` stays at a few degrees**
+The model predicts "stay still". See [Getting the model to move](#getting-the-model-to-move).
 
-**`RuntimeError: Cameras did not produce frames in 30s`**
-RealSense took too long to warm up. Try a USB 3 port, update D455 firmware with `rs-fw-update -r`, or unplug other USB video devices to free bandwidth.
+**Arm never moves; log says `no active chunks` / `inference is slower than the chunk duration`**
+You're in `--exec-mode async` on a slow device. Use `sync` (the default off CUDA).
 
-**Model produces near-zero actions (arm barely moves)**
-Auto white balance drift between sessions can cause this. The wrist camera white balance is locked at startup — make sure `v4l2-ctl` is installed (`sudo apt install v4l-utils`). Also try `--scene-only` to rule out wrist image quality as the cause.
+**Gripper barely opens**
+The gripper calibration range is too small. Recalibrate and open the gripper fully during the range step.
 
-**`ImportError: cannot import name 'Teleoperator'`**
-Wrong LeRobot version. Pin to exactly 0.5.1:
-```bash
-pip install --force-reinstall lerobot==0.5.1
-```
+**`ImportError: cannot import name 'Teleoperator'` / wrong lerobot**
+Run `uv sync` to restore the pinned versions from `uv.lock`.
+
+---
+
+## Credits
+
+- Original project: [irenegracekp/molmoact2-so101](https://github.com/irenegracekp/molmoact2-so101) (MIT)
+- Model: [allenai/MolmoAct2-SO100_101](https://huggingface.co/allenai/MolmoAct2-SO100_101) by AI2
+- Arm: [SO-ARM100/101](https://github.com/TheRobotStudio/SO-ARM100) by TheRobotStudio, driven via [LeRobot](https://github.com/huggingface/lerobot)

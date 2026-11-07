@@ -7,3 +7,4 @@ venv/
 outputs/
 saved_frames/
 *.mp4
+camera_snapshots/
