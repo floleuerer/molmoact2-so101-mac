@@ -22,7 +22,7 @@ Zero-shot robot manipulation with [MolmoAct2](https://huggingface.co/allenai/Mol
 |---|---|
 | Mac with Apple Silicon | Tested: M4 Pro, 48 GB, macOS 15. The model uses ~11 GB of unified memory in bfloat16; 32 GB+ RAM recommended. |
 | SO-101 follower arm | [TheRobotStudio SO-ARM100](https://github.com/TheRobotStudio/SO-ARM100), **with its own power supply** (USB alone does not power the servos) |
-| Scene camera | Any USB webcam, e.g. Logitech C920 (tested) or a Canon webcam |
+| Scene camera | Any USB webcam, e.g. Logitech C920 (tested), Logitech Brio or Razer Kiyo |
 | Wrist camera (optional) | Any USB webcam, e.g. Innomaker U20CAM-1080p (tested) |
 | Disk | ~22 GB for the model weights |
 
@@ -88,11 +88,11 @@ uv run cameras.py --url rtsp://camera.local:8554/stream   # test a network strea
 ```
 
 `--scene-cam` / `--wrist-cam` accept:
-- a **name substring** such as `C920`, `Innomaker` or `Canon` (recommended). macOS renumbers cameras whenever something is re-plugged, and the order shown by ffmpeg / System Information is *not* OpenCV's order. Names are resolved to the right index at startup.
+- a **name substring** such as `C920`, `Innomaker` or `Brio` (recommended). macOS renumbers cameras whenever something is re-plugged, and the order shown by ffmpeg / System Information is *not* OpenCV's order. Names are resolved to the right index at startup.
 - an **OpenCV index** such as `1`
 - a **stream URL** (`rtsp://`, `tcp://`, `http://`) such as `rtsp://camera.local:8554/stream`. A background thread keeps only the newest frame, so stream buffering doesn't add latency.
 
-Every frame is centre-cropped to 4:3 and resized to 640×480 (the training resolution), so 16:9 webcams such as the Canon EOS Webcam Utility or Continuity Camera are fine.
+Every frame is centre-cropped to 4:3 and resized to 640×480 (the training resolution), so 16:9 webcams, camera-as-webcam apps or an iPhone via Continuity Camera are fine.
 
 **Wrist orientation:** `--wrist-flip` defaults to `180` (the original author's camera is mounted upside down). If your wrist image looks upside down in `--show`, use `--wrist-flip none`. The focus aid always shows the unrotated image.
 

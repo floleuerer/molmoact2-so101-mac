@@ -11,7 +11,7 @@ stale buffered frame — essential for network streams, where OpenCV would
 otherwise queue frames and add seconds of latency.
 
 Frames are normalised to the model's input geometry (default 640×480): if the
-camera delivers another aspect ratio (e.g. 16:9 from a Canon webcam), the
+camera delivers another aspect ratio (e.g. a 16:9 webcam), the
 frame is centre-cropped to 4:3 before resizing so objects are not distorted.
 """
 import os
